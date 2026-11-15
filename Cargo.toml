@@ -1,0 +1,22 @@
+[package]
+name = "rfinder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rune = { path = "vendor/rune/crates/rune" }
+rune-kit = { path = "vendor/rune/crates/rune-kit" }
+libc = "0.2" # localtime_r, for dates in the local time zone
+
+# Rune requires apps to patch these to the same revision as Rune itself.
+[patch.crates-io]
+winit = { path = "vendor/rune/vendor/winit" }
+parley_engine = { path = "vendor/rune/vendor/parley_engine" }
+wgpu-hal = { path = "vendor/rune/vendor/wgpu-hal" }
+accesskit_windows = { path = "vendor/rune/vendor/accesskit_windows" }
+accesskit_macos = { path = "vendor/rune/vendor/accesskit_macos" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
