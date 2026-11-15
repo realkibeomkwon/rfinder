@@ -4,7 +4,7 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use rune::{Latest, PointerPress, TextEdit, Tx};
 use rune_kit::shell::PaneState;
-use rune_kit::{SortDir, TableState};
+use rune_kit::SortDir;
 
 use crate::format::{self, Look};
 
@@ -51,6 +51,8 @@ impl Entry {
 pub enum View {
     Icons,
     List,
+    Columns,
+    Gallery,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,7 +63,8 @@ pub enum Scope {
     Folder,
 }
 
-/// The icon view's selection (the list view's lives in its `TableState`).
+/// The selection, in every view: ids in the order picked, the keyboard cursor, and where a
+/// Shift-click extends from.
 #[derive(Default)]
 pub struct Picks {
     pub set: Vec<String>,
@@ -70,6 +73,24 @@ pub struct Picks {
 }
 
 /// Get Info's window: one item, with its folder size filled in once it's counted.
+/// One column of the column view: a folder's items and the one picked in it.
+pub struct Column {
+    pub dir: PathBuf,
+    pub entries: Vec<Entry>,
+    pub pick: Option<String>,
+}
+
+impl Column {
+    pub fn read(dir: PathBuf, hidden: bool) -> Column {
+        let mut entries: Vec<Entry> = std::fs::read_dir(&dir)
+            .map(|d| d.flatten().filter_map(|e| Entry::read(&e.path(), e.file_name().to_string_lossy().into_owned())).collect())
+            .unwrap_or_default();
+        entries.retain(|e| hidden || !e.name.starts_with('.'));
+        entries.sort_by(|a, b| rune_kit::natural_cmp(&a.name, &b.name));
+        Column { dir, entries, pick: None }
+    }
+}
+
 pub struct Info {
     pub path: PathBuf,
     pub entry: Entry,
@@ -86,8 +107,19 @@ pub struct App {
     /// Indices into `all` after hidden files are dropped, in sort order.
     pub rows: Vec<usize>,
     pub view: View,
-    pub table: TableState,
+    /// The list's sort: a column id and direction.
+    pub sort: (String, SortDir),
     pub picks: Picks,
+    /// The column view's columns, from the window's folder rightwards.
+    pub cols: Vec<Column>,
+    /// Whether ⌥ is held, which changes the context menu's items as in Finder.
+    pub alt: bool,
+    /// Items ⌥⌘⌫ is asking to delete for good.
+    pub confirm_delete: Option<Vec<PathBuf>>,
+    /// The Quick Look window Space opened, which Space closes again.
+    pub quick_look: Option<std::process::Child>,
+    /// System file icons and image previews, decoded off the UI thread (after `setup`).
+    pub images: Option<rune::ImageCache>,
     pub search: TextEdit,
     pub scope: Scope,
     /// Search results, found off the UI thread.
@@ -115,8 +147,6 @@ pub fn home() -> PathBuf {
 }
 
 pub fn init() -> App {
-    let mut table = TableState::new().multi_select(true);
-    table.set_sort("name", SortDir::Ascending);
     let args = rune::extra_args();
     let start = args.iter().map(PathBuf::from).find(|p| p.is_dir()).unwrap_or_else(home);
     let volumes = std::fs::read_dir("/Volumes").map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
@@ -128,8 +158,13 @@ pub fn init() -> App {
         all: vec![],
         rows: vec![],
         view: View::List,
-        table,
+        sort: ("name".into(), SortDir::Ascending),
         picks: Picks::default(),
+        cols: vec![],
+        alt: false,
+        confirm_delete: None,
+        quick_look: None,
+        images: None,
         search: TextEdit::new(""),
         scope: Scope::Mac,
         found: Latest::default().debounce(std::time::Duration::from_millis(150)),
@@ -180,7 +215,7 @@ pub fn load(s: &mut App) {
 pub fn refresh(s: &mut App) {
     let all = &s.all;
     s.rows = (0..all.len()).filter(|&i| s.hidden || !all[i].name.starts_with('.')).collect();
-    let (column, dir) = s.table.sort().map_or(("name", SortDir::Ascending), |(c, d)| (c, d));
+    let (column, dir) = (s.sort.0.as_str(), s.sort.1);
     s.rows.sort_by(|&a, &b| {
         let (a, b) = (&all[a], &all[b]);
         let name = || rune_kit::natural_cmp(&a.name, &b.name);
@@ -191,12 +226,12 @@ pub fn refresh(s: &mut App) {
             _ => name(),
         })
     });
-    // Drop selected ids that left the listing.
-    let present = |id: &str| s.rows.iter().any(|&i| all[i].id == id);
-    if s.table.selected().any(|id| !present(id)) {
-        s.table.clear_selection();
+    // Drop selected ids that left the listing (the column view's live in its columns).
+    if s.view == View::Columns && !searching(s) {
+        reload_cols(s);
+    } else {
+        s.picks.set.retain(|id| s.rows.iter().any(|&i| all[i].id == *id));
     }
-    s.picks.set.retain(|id| s.rows.iter().any(|&i| all[i].id == *id));
 }
 
 fn free_space(dir: &Path) -> Option<u64> {
@@ -284,98 +319,134 @@ pub fn row_ids(s: &App) -> impl Iterator<Item = &str> {
     s.rows.iter().map(|&i| s.all[i].id.as_str())
 }
 
-pub fn selected_ids(s: &App) -> Vec<String> {
-    match s.view {
-        View::List => {
-            // In listing order, as Finder acts on them.
-            row_ids(s).filter(|id| s.table.is_selected(id)).map(str::to_owned).collect()
-        }
-        View::Icons => row_ids(s).filter(|id| s.picks.set.iter().any(|p| p == id)).map(str::to_owned).collect(),
+/// Whether the column view is showing (a search lists its results instead).
+pub fn in_columns(s: &App) -> bool {
+    s.view == View::Columns && !searching(s)
+}
+
+/// The ids the keyboard moves through: the listing, or the column the cursor is in.
+pub fn active_ids(s: &App) -> Vec<String> {
+    if in_columns(s) {
+        let i = active_col(s);
+        return s.cols.get(i).map(|c| c.entries.iter().map(|e| col_id(s, &c.dir, &e.name)).collect()).unwrap_or_default();
     }
+    row_ids(s).map(str::to_owned).collect()
+}
+
+pub fn selected_ids(s: &App) -> Vec<String> {
+    if in_columns(s) {
+        return s.picks.set.clone();
+    }
+    // In listing order, as Finder acts on them.
+    row_ids(s).filter(|id| s.picks.set.iter().any(|p| p == id)).map(str::to_owned).collect()
 }
 
 pub fn selected_len(s: &App) -> usize {
-    match s.view {
-        View::List => s.table.selected_len(),
-        View::Icons => s.picks.set.len(),
-    }
+    s.picks.set.len()
 }
 
 pub fn is_selected(s: &App, id: &str) -> bool {
-    match s.view {
-        View::List => s.table.is_selected(id),
-        View::Icons => s.picks.set.iter().any(|p| p == id),
-    }
+    s.picks.set.iter().any(|p| p == id)
 }
 
 pub fn selected(s: &App) -> Vec<PathBuf> {
     selected_ids(s).iter().map(|n| s.dir.join(n)).collect()
 }
 
+/// The entry for `id`, from the listing or the column view.
+pub fn entry<'a>(s: &'a App, id: &str) -> Option<&'a Entry> {
+    s.all.iter().find(|e| e.id == id).or_else(|| {
+        let p = s.dir.join(id);
+        s.cols.iter().filter(|c| Some(c.dir.as_path()) == p.parent()).flat_map(|c| &c.entries).find(|e| p.file_name().is_some_and(|n| n == e.name.as_str()))
+    })
+}
+
 /// The one item an action on a single item (rename, Get Info) takes.
 pub fn focus_id(s: &App) -> Option<String> {
     let ids = selected_ids(s);
-    match s.view {
-        View::List => s.table.cursor().filter(|c| ids.iter().any(|i| i == c)).map(str::to_owned),
-        View::Icons => s.picks.cursor.clone().filter(|c| ids.contains(c)),
-    }
-    .or_else(|| ids.into_iter().next())
+    s.picks.cursor.clone().filter(|c| ids.contains(c)).or_else(|| ids.into_iter().next())
 }
 
 pub fn select_only(s: &mut App, id: String) {
-    s.table.select(id.clone());
     s.picks = Picks { set: vec![id.clone()], cursor: Some(id.clone()), anchor: Some(id) };
 }
 
 pub fn clear_selection(s: &mut App) {
-    s.table.clear_selection();
     s.picks = Picks::default();
 }
 
 pub fn select_all(s: &mut App) {
-    s.picks.set = row_ids(s).map(str::to_owned).collect();
-    // The table selects everything itself on ⌘A while it has focus; from elsewhere the
-    // closest it offers is the cursor's row.
-    if let Some(first) = s.picks.set.first().cloned() {
-        s.table.select(first);
+    s.picks.set = active_ids(s);
+}
+
+/// The scroll view each view keeps its items in, for `scroll_into_view_in`.
+pub fn scroller(s: &App) -> String {
+    match s.view {
+        _ if searching(s) && s.view == View::Columns => "list".into(),
+        View::List => "list".into(),
+        View::Icons => "icons".into(),
+        View::Gallery => "strip".into(),
+        View::Columns => format!("col:{}", active_col(s)),
     }
 }
 
 /// Selects `id` and scrolls it into view, in whichever view is showing.
 pub fn reveal(s: &mut App, id: String, tx: &mut Tx) {
-    select_only(s, id.clone());
-    match s.view {
-        View::List => s.table.reveal(id, tx),
-        View::Icons => tx.scroll_into_view_in("icons", id),
+    if in_columns(s) {
+        let p = s.dir.join(&id);
+        if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+            let name = name.to_string_lossy().into_owned();
+            if let Some(i) = s.cols.iter().position(|c| c.dir == parent) {
+                col_pick(s, i, &name);
+            }
+        }
+    } else {
+        select_only(s, id.clone());
     }
+    tx.scroll_into_view_in(scroller(s), id);
 }
 
-/// Switches views, keeping as much of the selection as the other view can hold.
+/// Switches views, keeping the selection.
 pub fn set_view(s: &mut App, v: View) {
     if s.view == v {
         return;
     }
-    let ids = selected_ids(s);
     let cursor = focus_id(s);
     s.view = v;
     match v {
-        View::Icons => s.picks = Picks { set: ids, cursor: cursor.clone(), anchor: cursor },
-        View::List => {
-            s.table.clear_selection();
-            if let Some(c) = cursor {
-                s.table.select(c);
+        View::Columns => {
+            s.cols = vec![Column::read(s.dir.clone(), s.hidden)];
+            clear_selection(s);
+            // Only an item of this folder has a place in the first column.
+            if let Some(c) = cursor.filter(|c| !c.contains('/')) {
+                col_pick(s, 0, &c);
+            }
+        }
+        _ => {
+            // Column picks deeper than this folder have no row here.
+            let search = searching(s);
+            s.picks.set.retain(|id| !id.contains('/') || search);
+            if s.picks.cursor.as_ref().is_some_and(|c| !s.picks.set.contains(c)) {
+                s.picks.cursor = s.picks.set.first().cloned();
+            }
+            // The gallery always shows an item.
+            if v == View::Gallery && s.picks.set.is_empty() {
+                let first = row_ids(s).next().map(str::to_owned);
+                if let Some(first) = first {
+                    select_only(s, first);
+                }
             }
         }
     }
 }
 
-/// An icon-view click on `id`: Shift extends from the anchor, ⌘ toggles, else selects it alone.
+/// A click on `id`: Shift extends from the anchor, ⌘ toggles, else selects it alone.
 pub fn pick(s: &mut App, id: &str, mods: rune::Mods) {
     if let (true, Some(anchor)) = (mods.shift, s.picks.anchor.clone()) {
-        let ids: Vec<&str> = row_ids(s).collect();
-        if let (Some(a), Some(b)) = (ids.iter().position(|i| *i == anchor), ids.iter().position(|i| *i == id)) {
+        let ids = active_ids(s);
+        if let (Some(a), Some(b)) = (ids.iter().position(|i| *i == anchor), ids.iter().position(|i| i == id)) {
             let (lo, hi) = (a.min(b), a.max(b));
-            s.picks.set = ids[lo..=hi].iter().map(|i| (*i).to_owned()).collect();
+            s.picks.set = ids[lo..=hi].to_vec();
             s.picks.cursor = Some(id.to_owned());
             return;
         }
@@ -393,24 +464,100 @@ pub fn pick(s: &mut App, id: &str, mods: rune::Mods) {
     select_only(s, id.to_owned());
 }
 
-/// Moves the icon view's cursor by `dx` columns and `dy` rows of `cols` per row.
-pub fn step_picks(s: &mut App, dx: isize, dy: isize, cols: usize, extend: bool, tx: &mut Tx) {
-    let ids: Vec<String> = row_ids(s).map(str::to_owned).collect();
+/// Moves the cursor by `by` items (a row of a grid is `cols` items), extending with Shift.
+pub fn step(s: &mut App, by: isize, extend: bool, tx: &mut Tx) {
+    let ids = active_ids(s);
     if ids.is_empty() {
         return;
     }
     let at = s.picks.cursor.as_ref().and_then(|c| ids.iter().position(|i| i == c));
     let next = match at {
+        None if by < 0 => ids.len() - 1,
         None => 0,
-        Some(i) => (i as isize + dx + dy * cols.max(1) as isize).clamp(0, ids.len() as isize - 1) as usize,
+        Some(i) => (i as isize + by).clamp(0, ids.len() as isize - 1) as usize,
     };
     let id = ids[next].clone();
-    if extend {
+    if in_columns(s) {
+        reveal(s, id, tx);
+    } else if extend {
         pick(s, &id, rune::Mods { shift: true, ..Default::default() });
+        tx.scroll_into_view_in(scroller(s), id);
     } else {
         select_only(s, id.clone());
+        tx.scroll_into_view_in(scroller(s), id);
     }
-    tx.scroll_into_view_in("icons", id);
+}
+
+// --- column view ------------------------------------------------------------
+
+/// The id of `name` in `dir`: its path relative to the window's folder.
+pub fn col_id(s: &App, dir: &Path, name: &str) -> String {
+    let p = dir.join(name);
+    p.strip_prefix(&s.dir).map_or_else(|_| p.to_string_lossy().into_owned(), |r| r.to_string_lossy().into_owned())
+}
+
+/// The column the keyboard is in: the last one with a pick, else the first.
+pub fn active_col(s: &App) -> usize {
+    s.cols.iter().rposition(|c| c.pick.is_some()).unwrap_or(0)
+}
+
+/// Picks `name` in column `i`: columns right of it close, and a folder opens the next one.
+pub fn col_pick(s: &mut App, i: usize, name: &str) {
+    if i >= s.cols.len() {
+        return;
+    }
+    s.cols.truncate(i + 1);
+    s.cols[i].pick = Some(name.to_owned());
+    let dir = s.cols[i].dir.clone();
+    let id = col_id(s, &dir, name);
+    select_only(s, id);
+    let folder = s.cols[i].entries.iter().find(|e| e.name == name).is_some_and(Entry::is_folder);
+    if folder {
+        s.cols.push(Column::read(dir.join(name), s.hidden));
+    }
+}
+
+/// → enters the picked folder's column; ← goes back to the column before.
+pub fn col_step(s: &mut App, right: bool, tx: &mut Tx) -> bool {
+    let i = active_col(s);
+    if right {
+        let Some(first) = s.cols.get(i + 1).and_then(|c| c.entries.first()).map(|e| e.name.clone()) else { return false };
+        col_pick(s, i + 1, &first);
+    } else {
+        if i == 0 {
+            return false;
+        }
+        let Some(name) = s.cols[i - 1].pick.clone() else { return false };
+        col_pick(s, i - 1, &name);
+    }
+    let id = focus_id(s).unwrap_or_default();
+    tx.scroll_into_view_in(scroller(s), id);
+    true
+}
+
+/// Re-reads every column after a change on disk, keeping the picks that still exist.
+pub fn reload_cols(s: &mut App) {
+    if s.cols.first().is_none_or(|c| c.dir != s.dir) {
+        s.cols = vec![Column::read(s.dir.clone(), s.hidden)];
+    }
+    let picks: Vec<Option<String>> = s.cols.iter().map(|c| c.pick.clone()).collect();
+    let dirs: Vec<PathBuf> = s.cols.iter().map(|c| c.dir.clone()).collect();
+    let mut cols = vec![];
+    for (dir, pick) in dirs.into_iter().zip(picks) {
+        if !dir.is_dir() {
+            break;
+        }
+        let mut c = Column::read(dir, s.hidden);
+        c.pick = pick.filter(|p| c.entries.iter().any(|e| &e.name == p));
+        let stop = c.pick.is_none();
+        cols.push(c);
+        if stop {
+            break;
+        }
+    }
+    s.cols = cols;
+    let keep: Vec<String> = s.picks.set.iter().filter(|id| s.dir.join(id).exists()).cloned().collect();
+    s.picks.set = keep;
 }
 
 /// Whether a name is being typed (keys less than a second apart), so Space types a space.
@@ -431,11 +578,13 @@ pub fn type_select(s: &mut App, t: &str, tx: &mut Tx) -> bool {
     }
     s.typed = (format!("{}{}", s.typed.0, t.to_lowercase()), Some(now));
     let q = s.typed.0.clone();
-    let hit = s.rows.iter().map(|&i| &s.all[i]).find(|e| e.name.to_lowercase().starts_with(&q)).or_else(|| {
+    let ids = active_ids(s);
+    let name = |id: &String| Path::new(id).file_name().map_or_else(|| id.to_lowercase(), |n| n.to_string_lossy().to_lowercase());
+    let hit = ids.iter().find(|id| name(id).starts_with(&q)).or_else(|| {
         // Past every match: the first item after where the typed text would sort.
-        s.rows.iter().map(|&i| &s.all[i]).find(|e| rune_kit::natural_cmp(&e.name.to_lowercase(), &q).is_gt())
+        ids.iter().find(|id| rune_kit::natural_cmp(&name(id), &q).is_gt())
     });
-    if let Some(id) = hit.map(|e| e.id.clone()) {
+    if let Some(id) = hit.cloned() {
         reveal(s, id, tx);
     }
     true
@@ -457,6 +606,7 @@ pub fn entered(s: &mut App) {
     s.found.cancel();
     s.renaming = None;
     clear_selection(s);
+    s.cols.clear();
     load(s);
 }
 

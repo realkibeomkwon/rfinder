@@ -177,7 +177,11 @@ fn icon_view_picks_extend_toggle_and_survive_a_switch() {
     model::pick(&mut s, "b", rune::Mods { cmd: true, ..Default::default() });
     assert_eq!(model::selected_ids(&s), ["a", "c"]);
     model::set_view(&mut s, View::List);
-    // The list keeps one: the cursor's item, or the first selected when ⌘ took the cursor's off.
+    // Every view shares one selection now, so the list keeps both.
+    assert_eq!(model::selected_ids(&s), ["a", "c"]);
+    // The gallery always shows an item.
+    model::clear_selection(&mut s);
+    model::set_view(&mut s, View::Gallery);
     assert_eq!(model::selected_ids(&s), ["a"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }
@@ -196,4 +200,53 @@ fn every_menu_shortcut_parses() {
     for keys in ["cmd+shift+n", "cmd+backspace", "cmd+alt+v", "cmd+shift+period", "cmd+bracketleft", "cmd+up", "cmd+alt+l", "cmd+ctrl+s"] {
         assert!(keys.parse::<rune::Shortcut>().is_ok(), "{keys}");
     }
+}
+
+#[test]
+fn column_view_opens_a_column_per_picked_folder() {
+    let dir = scratch("cols");
+    std::fs::create_dir_all(dir.join("a/b")).unwrap();
+    std::fs::write(dir.join("a/b/deep.txt"), "x").unwrap();
+    std::fs::write(dir.join("a/one.txt"), "x").unwrap();
+    std::fs::write(dir.join("top.txt"), "x").unwrap();
+    let mut s = app_in(&dir);
+    model::set_view(&mut s, View::Columns);
+    assert_eq!(s.cols.len(), 1);
+    model::col_pick(&mut s, 0, "a");
+    assert_eq!(s.cols.len(), 2);
+    assert_eq!(s.cols[1].entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["b", "one.txt"]);
+    model::col_pick(&mut s, 1, "b");
+    model::col_pick(&mut s, 2, "deep.txt");
+    // Ids are relative to the window's folder, so every command finds the file.
+    assert_eq!(model::selected(&s), [dir.join("a/b/deep.txt")]);
+    assert_eq!(model::active_col(&s), 2);
+    // Picking higher up closes the columns to its right.
+    model::col_pick(&mut s, 0, "top.txt");
+    assert_eq!(s.cols.len(), 1);
+    // A rename in a deep column keeps working.
+    model::col_pick(&mut s, 0, "a");
+    model::col_pick(&mut s, 1, "one.txt");
+    ops::begin_rename(&mut s, "a/one.txt".into());
+    s.rename = rune::TextEdit::new("two.txt");
+    ops::commit_rename(&mut s);
+    assert!(dir.join("a/two.txt").exists());
+    assert_eq!(s.cols[1].entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["b", "two.txt"]);
+    assert_eq!(model::selected_ids(&s), ["a/two.txt"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn delete_immediately_asks_then_removes_for_good() {
+    let dir = scratch("delete");
+    std::fs::create_dir_all(dir.join("folder/inner")).unwrap();
+    std::fs::write(dir.join("file.txt"), "x").unwrap();
+    let mut s = app_in(&dir);
+    model::select_all(&mut s);
+    ops::ask_delete(&mut s);
+    assert_eq!(s.confirm_delete.as_ref().map(Vec::len), Some(2));
+    assert!(dir.join("file.txt").exists(), "nothing goes before the answer");
+    ops::delete_now(&mut s);
+    assert!(!dir.join("file.txt").exists() && !dir.join("folder").exists());
+    assert!(s.rows.is_empty() && s.error.is_none());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

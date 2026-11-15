@@ -64,7 +64,7 @@ pub fn sidebar(s: &App, k: &Kit) -> El {
     bar.section(places).build(k)
 }
 
-/// Finder's view switcher: icons (⌘1) and list (⌘2), the chosen one pressed in.
+/// Finder's view switcher: icons (⌘1), list (⌘2), columns (⌘3) and gallery (⌘4).
 fn view_switch(s: &App, k: &Kit) -> El {
     let seg = |glyph: &'static Icon, label: &str, v: View| {
         let on = s.view == v;
@@ -85,7 +85,15 @@ fn view_switch(s: &App, k: &Kit) -> El {
         }
         b
     };
-    row().key("views").role("radiogroup").label("보기").gap(1.0).child(seg(&icons::VIEW_ICONS, "아이콘", View::Icons)).child(seg(&icons::VIEW_LIST, "목록", View::List))
+    row()
+        .key("views")
+        .role("radiogroup")
+        .label("보기")
+        .gap(1.0)
+        .child(seg(&icons::VIEW_ICONS, "아이콘", View::Icons))
+        .child(seg(&icons::VIEW_LIST, "목록", View::List))
+        .child(seg(&icons::VIEW_COLUMNS, "계층", View::Columns))
+        .child(seg(&icons::VIEW_GALLERY, "갤러리", View::Gallery))
 }
 
 pub fn toolbar(s: &App, k: &Kit) -> Toolbar {

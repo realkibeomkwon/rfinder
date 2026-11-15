@@ -82,3 +82,22 @@ pub fn open_goto(s: &mut App) {
     e.focused = true;
     s.goto = Some(e);
 }
+
+/// ⌥⌘⌫'s question, worded as Finder's.
+pub fn confirm_delete(s: &App, k: &Kit, layer: &mut Vec<El>) {
+    let Some(paths) = &s.confirm_delete else { return };
+    let what = match paths.as_slice() {
+        [one] => format!("“{}” 항목을", crate::model::display_name(one)),
+        many => format!("{}개 항목을", many.len()),
+    };
+    let cancel = Button::new("취소").on_press(|s: &mut App| s.confirm_delete = None).build(k);
+    let delete = Button::new("삭제").variant(ButtonVariant::Danger).on_press(ops::delete_now).build(k);
+    let body = col()
+        .w_full()
+        .px(16.0)
+        .pb(16.0)
+        .gap(14.0)
+        .child(text("이 동작은 실행 취소할 수 없습니다.").font(k.ty.text_small).color(k.c.text_muted))
+        .child(row().w_full().gap(8.0).justify_end().child(cancel).child(delete));
+    Dialog::new("delete", format!("{what} 즉시 삭제하겠습니까?")).open(true).fit().width(380.0).click_outside(false).child(body).on_close(|s: &mut App| s.confirm_delete = None).build(k, layer);
+}

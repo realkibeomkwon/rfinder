@@ -39,6 +39,16 @@ pub static APPS: Icon = Icon {
     view: 16.0,
     body: r#"<path d="M8 2.5L13.5 13.5H2.5Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" fill="none"/><path d="M5.3 9.5H10.7" stroke="currentColor" stroke-width="1.2"/>"#,
 };
+pub static VIEW_COLUMNS: Icon = Icon {
+    name: "rf-view-columns",
+    view: 16.0,
+    body: r#"<rect x="2" y="3" width="12" height="10" rx="1.5" stroke="currentColor" stroke-width="1.2" fill="none"/><path d="M6 3V13M10 3V13" stroke="currentColor" stroke-width="1.2"/>"#,
+};
+pub static VIEW_GALLERY: Icon = Icon {
+    name: "rf-view-gallery",
+    view: 16.0,
+    body: r#"<rect x="2.5" y="2.5" width="11" height="7.5" rx="1.2" stroke="currentColor" stroke-width="1.2" fill="none"/><rect x="2.5" y="11.5" width="2.5" height="2" rx="0.5" fill="currentColor"/><rect x="6.75" y="11.5" width="2.5" height="2" rx="0.5" fill="currentColor"/><rect x="11" y="11.5" width="2.5" height="2" rx="0.5" fill="currentColor"/>"#,
+};
 pub static HOUSE: Icon = Icon {
     name: "rf-house",
     view: 16.0,

@@ -95,6 +95,15 @@ fn as_icons(s: &mut App, _: &mut Tx) {
 fn as_list(s: &mut App, _: &mut Tx) {
     model::set_view(s, View::List);
 }
+fn as_columns(s: &mut App, _: &mut Tx) {
+    model::set_view(s, View::Columns);
+}
+fn as_gallery(s: &mut App, _: &mut Tx) {
+    model::set_view(s, View::Gallery);
+}
+fn delete_now(s: &mut App, _: &mut Tx) {
+    ops::ask_delete(s);
+}
 fn hidden(s: &mut App, _: &mut Tx) {
     ops::toggle_hidden(s);
 }
@@ -111,13 +120,29 @@ fn reload(s: &mut App, _: &mut Tx) {
 /// Keys the window handles once the focused control passes them on.
 pub fn key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     let m = ev.mods;
+    // ⌥ changes the context menu's items while it's held, as in Finder.
+    if let Key::Modifier { modifier, pressed } = &ev.key {
+        if matches!(modifier, rune::Modifier::AltLeft | rune::Modifier::AltRight) {
+            s.alt = *pressed;
+        }
+        return false;
+    }
     let run: Command = match &ev.key {
         Key::Up if m.cmd => {
             return model::up(s, tx);
         }
         Key::Down if m.cmd => open,
+        Key::Backspace if m.cmd && m.alt && !m.shift => delete_now,
         Key::Backspace if m.cmd && !m.shift => trash,
         Key::Enter if !m.cmd => return ops::begin_rename_selected(s),
+        Key::Up if !m.cmd && !m.alt => {
+            model::step(s, -1, m.shift, tx);
+            return true;
+        }
+        Key::Down if !m.cmd && !m.alt => {
+            model::step(s, 1, m.shift, tx);
+            return true;
+        }
         Key::Escape if s.menu.is_some() => {
             s.menu = None;
             return true;
@@ -141,6 +166,9 @@ pub fn key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             ('f', false, false) => find,
             ('1', false, false) => as_icons,
             ('2', false, false) => as_list,
+            ('3', false, false) => as_columns,
+            ('4', false, false) => as_gallery,
+            ('i', false, true) => info,
             ('n', true, false) => new_folder,
             ('.', true, false) => hidden,
             ('g', true, false) => goto,
@@ -184,6 +212,7 @@ pub fn menu_bar() -> Vec<MenuItem<App>> {
         item("파일", "훑어보기", "cmd+y", quick_look),
         sep("파일"),
         item("파일", "휴지통으로 이동", "cmd+backspace", trash),
+        item("파일", "즉시 삭제…", "cmd+alt+backspace", delete_now),
         item("편집", "복사", "cmd+c", ops::copy),
         item("편집", "붙여넣기", "cmd+v", paste),
         item("편집", "항목 이동", "cmd+alt+v", move_here),
@@ -191,6 +220,8 @@ pub fn menu_bar() -> Vec<MenuItem<App>> {
         item("편집", "경로 이름 복사", "cmd+alt+c", ops::copy_path),
         item("보기", "아이콘으로", "cmd+1", as_icons),
         item("보기", "목록으로", "cmd+2", as_list),
+        item("보기", "계층으로", "cmd+3", as_columns),
+        item("보기", "갤러리로", "cmd+4", as_gallery),
         sep("보기"),
         item("보기", "숨김 파일 보기/가리기", "cmd+shift+period", hidden),
         item("보기", "사이드바 보기/가리기", "cmd+ctrl+s", sidebar),

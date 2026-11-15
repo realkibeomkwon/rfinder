@@ -21,7 +21,7 @@ fn run(cmd: &str, args: &[&OsStr]) -> std::io::Result<()> {
 }
 
 fn entry<'a>(s: &'a App, id: &str) -> Option<&'a Entry> {
-    s.all.iter().find(|e| e.id == id)
+    model::entry(s, id)
 }
 
 pub fn open(s: &mut App, id: &str) {
@@ -117,8 +117,15 @@ pub fn commit_rename(s: &mut App) {
     }
     let r = std::fs::rename(&old, &to);
     model::load(s);
-    let new_id = if id.contains('/') { to.to_string_lossy().into_owned() } else { new };
-    model::select_only(s, new_id);
+    let column = to.parent().and_then(|p| s.cols.iter().position(|c| c.dir == p));
+    match column {
+        // In the column view the renamed item stays picked in its column.
+        Some(i) if model::in_columns(s) => model::col_pick(s, i, &new),
+        _ => {
+            let new_id = if id.contains('/') { to.to_string_lossy().into_owned() } else { new };
+            model::select_only(s, new_id);
+        }
+    }
     fail(s, "이름을 변경할 수 없음", r);
 }
 
@@ -273,7 +280,7 @@ pub fn compress(s: &mut App) {
 /// ⌘I: Get Info for the selection, or for the folder itself with nothing selected.
 pub fn get_info(s: &mut App) {
     let (path, entry) = match model::focus_id(s) {
-        Some(id) => (s.dir.join(&id), s.all.iter().find(|e| e.id == id).cloned()),
+        Some(id) => (s.dir.join(&id), model::entry(s, &id).cloned()),
         None => (s.dir.clone(), None),
     };
     let Some(entry) = entry.or_else(|| Entry::read(&path, model::display_name(&path))) else { return };
@@ -342,12 +349,48 @@ pub fn show_in_folder(s: &mut App, tx: &mut Tx) {
     }
 }
 
+/// Space: Quick Look on the selection, or closes the Quick Look window it opened.
 pub fn quick_look(s: &mut App) {
+    if let Some(mut child) = s.quick_look.take()
+        && child.try_wait().ok().flatten().is_none()
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+    let paths = model::selected(s);
+    if paths.is_empty() {
+        return;
+    }
+    let r = Command::new("/usr/bin/qlmanage").arg("-p").args(&paths).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+    match r {
+        Ok(child) => s.quick_look = Some(child),
+        Err(e) => s.error = Some(format!("훑어볼 수 없음: {e}")),
+    }
+}
+
+/// ⌥⌘⌫ asks first (`confirm_delete`); this deletes for good, without the Trash.
+pub fn ask_delete(s: &mut App) {
     let paths = model::selected(s);
     if !paths.is_empty() {
-        let r = Command::new("/usr/bin/qlmanage").arg("-p").args(&paths).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().map(drop);
-        fail(s, "훑어볼 수 없음", r);
+        s.confirm_delete = Some(paths);
     }
+}
+
+pub fn delete_now(s: &mut App) {
+    let Some(paths) = s.confirm_delete.take() else { return };
+    for p in &paths {
+        let r = match std::fs::symlink_metadata(p) {
+            Ok(m) if m.is_dir() => std::fs::remove_dir_all(p),
+            Ok(_) => std::fs::remove_file(p),
+            Err(e) => Err(e),
+        };
+        fail(s, "삭제할 수 없음", r);
+    }
+    let err = s.error.take();
+    model::clear_selection(s);
+    model::load(s);
+    s.error = err;
 }
 
 pub fn toggle_hidden(s: &mut App) {
