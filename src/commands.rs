@@ -120,13 +120,6 @@ fn reload(s: &mut App, _: &mut Tx) {
 /// Keys the window handles once the focused control passes them on.
 pub fn key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     let m = ev.mods;
-    // ⌥ changes the context menu's items while it's held, as in Finder.
-    if let Key::Modifier { modifier, pressed } = &ev.key {
-        if matches!(modifier, rune::Modifier::AltLeft | rune::Modifier::AltRight) {
-            s.alt = *pressed;
-        }
-        return false;
-    }
     let run: Command = match &ev.key {
         Key::Up if m.cmd => {
             return model::up(s, tx);

@@ -32,7 +32,8 @@ fn context_menu_el(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         })
     };
     // The menu opens at the pointer, so its trigger is an empty anchor outside the list's layout.
-    let menu = context_menu("file-menu", el(), s.menu);
+    // As wide as its ⌥ alternates need, so the menu keeps its width while ⌥ goes down and up.
+    let menu = context_menu("file-menu", el(), s.menu).min_width(260.0);
     // Holding ⌥ swaps items for their alternates, as Finder's menu does.
     let alt = s.alt;
     let menu = if some {
@@ -216,7 +217,8 @@ fn main() {
         min_size: Some((560.0, 320.0)),
         ..AppSpec::new("rfinder", (920.0, 560.0), model::init, view)
     };
-    let mut app = rune::App::new(spec).chrome(chrome);
+    // Finder's menus swap items the moment ⌥ goes down or up, even while one is open.
+    let mut app = rune::App::new(spec).chrome(chrome).on_modifiers(|s: &mut App, mods, _| s.alt = mods.alt);
     for item in commands::menu_bar() {
         app = app.menu_item(item);
     }
