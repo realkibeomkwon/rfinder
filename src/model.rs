@@ -1,0 +1,653 @@
+//! The window's state: the folder shown, its items, the selection, history and search.
+use std::path::{Path, PathBuf};
+use std::time::{Instant, UNIX_EPOCH};
+
+use rune::{Latest, PointerPress, TextEdit, Tx};
+use rune_kit::shell::PaneState;
+use rune_kit::SortDir;
+
+use crate::format::{self, Look};
+
+#[derive(Clone, Debug)]
+pub struct Entry {
+    /// The row's id: the name in a folder listing, the full path in search results. Either way
+    /// `dir.join(id)` is the item's path.
+    pub id: String,
+    pub name: String,
+    pub dir: bool,
+    pub size: u64,
+    pub modified: i64,
+    pub created: i64,
+    pub kind: String,
+    pub look: Look,
+}
+
+impl Entry {
+    pub fn read(path: &Path, id: String) -> Option<Entry> {
+        let lm = std::fs::symlink_metadata(path).ok()?;
+        // `fs::metadata` follows symlinks, so a link to a folder opens as one.
+        let m = std::fs::metadata(path).unwrap_or(lm.clone());
+        let name = path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
+        let secs = |t: std::io::Result<std::time::SystemTime>| t.ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs() as i64);
+        let (dir, link) = (m.is_dir(), lm.file_type().is_symlink());
+        Some(Entry {
+            id,
+            kind: format::kind(&name, dir, link),
+            look: format::look(&name, dir),
+            size: m.len(),
+            modified: secs(m.modified()),
+            created: secs(m.created()),
+            name,
+            dir,
+        })
+    }
+    /// A bundle (.app) is a folder Finder launches instead of entering.
+    pub fn is_folder(&self) -> bool {
+        self.dir && self.look == Look::Folder
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Icons,
+    List,
+    Columns,
+    Gallery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// Spotlight's whole Mac, Finder's default.
+    Mac,
+    /// The folder the search started in, and everything inside it.
+    Folder,
+}
+
+/// The selection, in every view: ids in the order picked, the keyboard cursor, and where a
+/// Shift-click extends from.
+#[derive(Default)]
+pub struct Picks {
+    pub set: Vec<String>,
+    pub cursor: Option<String>,
+    pub anchor: Option<String>,
+}
+
+/// Get Info's window: one item, with its folder size filled in once it's counted.
+/// One column of the column view: a folder's items and the one picked in it.
+pub struct Column {
+    pub dir: PathBuf,
+    pub entries: Vec<Entry>,
+    pub pick: Option<String>,
+}
+
+impl Column {
+    pub fn read(dir: PathBuf, hidden: bool) -> Column {
+        let mut entries: Vec<Entry> = std::fs::read_dir(&dir)
+            .map(|d| d.flatten().filter_map(|e| Entry::read(&e.path(), e.file_name().to_string_lossy().into_owned())).collect())
+            .unwrap_or_default();
+        entries.retain(|e| hidden || !e.name.starts_with('.'));
+        entries.sort_by(|a, b| rune_kit::natural_cmp(&a.name, &b.name));
+        Column { dir, entries, pick: None }
+    }
+}
+
+pub struct Info {
+    pub path: PathBuf,
+    pub entry: Entry,
+    /// Bytes and items, counted off the UI thread for a folder.
+    pub total: Option<(u64, u64)>,
+}
+
+pub struct App {
+    pub sidebar: PaneState,
+    pub dir: PathBuf,
+    pub back: Vec<PathBuf>,
+    pub fwd: Vec<PathBuf>,
+    pub all: Vec<Entry>,
+    /// Indices into `all` after hidden files are dropped, in sort order.
+    pub rows: Vec<usize>,
+    pub view: View,
+    /// The list's sort: a column id and direction.
+    pub sort: (String, SortDir),
+    pub picks: Picks,
+    /// The column view's columns, from the window's folder rightwards.
+    pub cols: Vec<Column>,
+    /// Whether ⌥ is held, which changes the context menu's items as in Finder.
+    pub alt: bool,
+    /// Items ⌥⌘⌫ is asking to delete for good.
+    pub confirm_delete: Option<Vec<PathBuf>>,
+    /// The Quick Look window Space opened, which Space closes again.
+    pub quick_look: Option<std::process::Child>,
+    /// System file icons and image previews, decoded off the UI thread (after `setup`).
+    pub images: Option<rune::ImageCache>,
+    pub search: TextEdit,
+    pub scope: Scope,
+    /// Search results, found off the UI thread.
+    pub found: Latest<Vec<Entry>>,
+    pub hidden: bool,
+    pub menu: Option<PointerPress>,
+    pub renaming: Option<String>,
+    pub rename: TextEdit,
+    /// What ⌘C copied, for when the system clipboard can't be read back.
+    pub clip: Vec<PathBuf>,
+    pub volumes: Vec<PathBuf>,
+    pub free: Option<u64>,
+    pub error: Option<String>,
+    pub info: Option<Info>,
+    pub totals: Latest<(PathBuf, u64, u64)>,
+    /// "Go to Folder" (⇧⌘G), while open.
+    pub goto: Option<TextEdit>,
+    /// Type-to-select: what's been typed and when the last key came.
+    pub typed: (String, Option<Instant>),
+    pub drop_over: Option<String>,
+}
+
+pub fn home() -> PathBuf {
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
+}
+
+pub fn init() -> App {
+    let args = rune::extra_args();
+    let start = args.iter().map(PathBuf::from).find(|p| p.is_dir()).unwrap_or_else(home);
+    let volumes = std::fs::read_dir("/Volumes").map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+    let mut s = App {
+        sidebar: PaneState::new(190.0).range(140.0, 400.0),
+        dir: start,
+        back: vec![],
+        fwd: vec![],
+        all: vec![],
+        rows: vec![],
+        view: View::List,
+        sort: ("name".into(), SortDir::Ascending),
+        picks: Picks::default(),
+        cols: vec![],
+        alt: false,
+        confirm_delete: None,
+        quick_look: None,
+        images: None,
+        search: TextEdit::new(""),
+        scope: Scope::Mac,
+        found: Latest::default().debounce(std::time::Duration::from_millis(150)),
+        hidden: false,
+        menu: None,
+        renaming: None,
+        rename: TextEdit::new(""),
+        clip: vec![],
+        volumes,
+        free: None,
+        error: None,
+        info: None,
+        totals: Latest::default(),
+        goto: None,
+        typed: (String::new(), None),
+        drop_over: None,
+    };
+    load(&mut s);
+    s
+}
+
+// --- listing ----------------------------------------------------------------
+
+pub fn searching(s: &App) -> bool {
+    !s.search.text.trim().is_empty()
+}
+
+// shortcut: reads the folder on the UI thread (about 20 ms per 10,000 entries on an SSD);
+// move to `rune::Latest` if network volumes or huge folders stall the window.
+pub fn load(s: &mut App) {
+    s.error = None;
+    s.free = free_space(&s.dir);
+    if searching(s) {
+        request_search(s);
+        return;
+    }
+    s.all = match std::fs::read_dir(&s.dir) {
+        Ok(d) => d.flatten().filter_map(|e| Entry::read(&e.path(), e.file_name().to_string_lossy().into_owned())).collect(),
+        Err(e) => {
+            s.error = Some(format!("폴더를 열 수 없음: {e}"));
+            vec![]
+        }
+    };
+    refresh(s);
+}
+
+/// Rebuilds `rows` from `all`: hidden files out, then the sort.
+pub fn refresh(s: &mut App) {
+    let all = &s.all;
+    s.rows = (0..all.len()).filter(|&i| s.hidden || !all[i].name.starts_with('.')).collect();
+    let (column, dir) = (s.sort.0.as_str(), s.sort.1);
+    s.rows.sort_by(|&a, &b| {
+        let (a, b) = (&all[a], &all[b]);
+        let name = || rune_kit::natural_cmp(&a.name, &b.name);
+        dir.apply(match column {
+            "modified" => a.modified.cmp(&b.modified).then_with(name),
+            "size" => a.size.cmp(&b.size).then_with(name),
+            "kind" => a.kind.cmp(&b.kind).then_with(name),
+            _ => name(),
+        })
+    });
+    // Drop selected ids that left the listing (the column view's live in its columns).
+    if s.view == View::Columns && !searching(s) {
+        reload_cols(s);
+    } else {
+        s.picks.set.retain(|id| s.rows.iter().any(|&i| all[i].id == *id));
+    }
+}
+
+fn free_space(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid C string and `st` is plain data `statvfs` fills.
+    let st = unsafe {
+        let mut st: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut st) != 0 {
+            return None;
+        }
+        st
+    };
+    Some(st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+// --- search -----------------------------------------------------------------
+
+const MAX_RESULTS: usize = 2000;
+
+pub fn request_search(s: &mut App) {
+    let q = s.search.text.trim().to_owned();
+    if q.is_empty() {
+        s.found.cancel();
+        load(s);
+        return;
+    }
+    let root = match s.scope {
+        Scope::Mac => None,
+        Scope::Folder => Some(s.dir.clone()),
+    };
+    let hidden = s.hidden;
+    s.found.request((q, root), move |(q, root): (String, Option<PathBuf>)| find(&q, root.as_deref(), hidden));
+}
+
+/// Items whose names contain `q`, as Finder's search field finds them: Spotlight on a Mac
+/// (`root` limits it to one folder), else a walk of `root` (or the home folder).
+pub fn find(q: &str, root: Option<&Path>, hidden: bool) -> Vec<Entry> {
+    let mut paths = spotlight(q, root).unwrap_or_else(|| walk(q, root.map_or_else(home, Path::to_path_buf), hidden));
+    paths.truncate(MAX_RESULTS);
+    paths.into_iter().filter_map(|p| Entry::read(&p, p.to_string_lossy().into_owned())).collect()
+}
+
+fn spotlight(q: &str, root: Option<&Path>) -> Option<Vec<PathBuf>> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let mut cmd = std::process::Command::new("/usr/bin/mdfind");
+    if let Some(r) = root {
+        cmd.arg("-onlyin").arg(r);
+    }
+    let out = cmd.arg("-name").arg(q).output().ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).lines().take(MAX_RESULTS).map(PathBuf::from).collect())
+}
+
+fn walk(q: &str, root: PathBuf, hidden: bool) -> Vec<PathBuf> {
+    let q = q.to_lowercase();
+    let (mut out, mut stack, mut seen) = (vec![], vec![root], 0usize);
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            seen += 1;
+            if seen > 200_000 || out.len() >= MAX_RESULTS {
+                return out;
+            }
+            let name = e.file_name().to_string_lossy().to_lowercase();
+            if !hidden && name.starts_with('.') {
+                continue;
+            }
+            let p = e.path();
+            if name.contains(&q) {
+                out.push(p.clone());
+            }
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(p);
+            }
+        }
+    }
+    out
+}
+
+// --- selection --------------------------------------------------------------
+
+pub fn row_ids(s: &App) -> impl Iterator<Item = &str> {
+    s.rows.iter().map(|&i| s.all[i].id.as_str())
+}
+
+/// Whether the column view is showing (a search lists its results instead).
+pub fn in_columns(s: &App) -> bool {
+    s.view == View::Columns && !searching(s)
+}
+
+/// The ids the keyboard moves through: the listing, or the column the cursor is in.
+pub fn active_ids(s: &App) -> Vec<String> {
+    if in_columns(s) {
+        let i = active_col(s);
+        return s.cols.get(i).map(|c| c.entries.iter().map(|e| col_id(s, &c.dir, &e.name)).collect()).unwrap_or_default();
+    }
+    row_ids(s).map(str::to_owned).collect()
+}
+
+pub fn selected_ids(s: &App) -> Vec<String> {
+    if in_columns(s) {
+        return s.picks.set.clone();
+    }
+    // In listing order, as Finder acts on them.
+    row_ids(s).filter(|id| s.picks.set.iter().any(|p| p == id)).map(str::to_owned).collect()
+}
+
+pub fn selected_len(s: &App) -> usize {
+    s.picks.set.len()
+}
+
+pub fn is_selected(s: &App, id: &str) -> bool {
+    s.picks.set.iter().any(|p| p == id)
+}
+
+pub fn selected(s: &App) -> Vec<PathBuf> {
+    selected_ids(s).iter().map(|n| s.dir.join(n)).collect()
+}
+
+/// The entry for `id`, from the listing or the column view.
+pub fn entry<'a>(s: &'a App, id: &str) -> Option<&'a Entry> {
+    s.all.iter().find(|e| e.id == id).or_else(|| {
+        let p = s.dir.join(id);
+        s.cols.iter().filter(|c| Some(c.dir.as_path()) == p.parent()).flat_map(|c| &c.entries).find(|e| p.file_name().is_some_and(|n| n == e.name.as_str()))
+    })
+}
+
+/// The one item an action on a single item (rename, Get Info) takes.
+pub fn focus_id(s: &App) -> Option<String> {
+    let ids = selected_ids(s);
+    s.picks.cursor.clone().filter(|c| ids.contains(c)).or_else(|| ids.into_iter().next())
+}
+
+pub fn select_only(s: &mut App, id: String) {
+    s.picks = Picks { set: vec![id.clone()], cursor: Some(id.clone()), anchor: Some(id) };
+}
+
+pub fn clear_selection(s: &mut App) {
+    s.picks = Picks::default();
+}
+
+pub fn select_all(s: &mut App) {
+    s.picks.set = active_ids(s);
+}
+
+/// The scroll view each view keeps its items in, for `scroll_into_view_in`.
+pub fn scroller(s: &App) -> String {
+    match s.view {
+        _ if searching(s) && s.view == View::Columns => "list".into(),
+        View::List => "list".into(),
+        View::Icons => "icons".into(),
+        View::Gallery => "strip".into(),
+        View::Columns => format!("col:{}", active_col(s)),
+    }
+}
+
+/// Selects `id` and scrolls it into view, in whichever view is showing.
+pub fn reveal(s: &mut App, id: String, tx: &mut Tx) {
+    if in_columns(s) {
+        let p = s.dir.join(&id);
+        if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+            let name = name.to_string_lossy().into_owned();
+            if let Some(i) = s.cols.iter().position(|c| c.dir == parent) {
+                col_pick(s, i, &name);
+            }
+        }
+    } else {
+        select_only(s, id.clone());
+    }
+    tx.scroll_into_view_in(scroller(s), id);
+}
+
+/// Switches views, keeping the selection.
+pub fn set_view(s: &mut App, v: View) {
+    if s.view == v {
+        return;
+    }
+    let cursor = focus_id(s);
+    s.view = v;
+    match v {
+        View::Columns => {
+            s.cols = vec![Column::read(s.dir.clone(), s.hidden)];
+            clear_selection(s);
+            // Only an item of this folder has a place in the first column.
+            if let Some(c) = cursor.filter(|c| !c.contains('/')) {
+                col_pick(s, 0, &c);
+            }
+        }
+        _ => {
+            // Column picks deeper than this folder have no row here.
+            let search = searching(s);
+            s.picks.set.retain(|id| !id.contains('/') || search);
+            if s.picks.cursor.as_ref().is_some_and(|c| !s.picks.set.contains(c)) {
+                s.picks.cursor = s.picks.set.first().cloned();
+            }
+            // The gallery always shows an item.
+            if v == View::Gallery && s.picks.set.is_empty() {
+                let first = row_ids(s).next().map(str::to_owned);
+                if let Some(first) = first {
+                    select_only(s, first);
+                }
+            }
+        }
+    }
+}
+
+/// A click on `id`: Shift extends from the anchor, ⌘ toggles, else selects it alone.
+pub fn pick(s: &mut App, id: &str, mods: rune::Mods) {
+    if let (true, Some(anchor)) = (mods.shift, s.picks.anchor.clone()) {
+        let ids = active_ids(s);
+        if let (Some(a), Some(b)) = (ids.iter().position(|i| *i == anchor), ids.iter().position(|i| i == id)) {
+            let (lo, hi) = (a.min(b), a.max(b));
+            s.picks.set = ids[lo..=hi].to_vec();
+            s.picks.cursor = Some(id.to_owned());
+            return;
+        }
+    }
+    if mods.cmd {
+        if let Some(i) = s.picks.set.iter().position(|p| p == id) {
+            s.picks.set.remove(i);
+        } else {
+            s.picks.set.push(id.to_owned());
+        }
+        s.picks.cursor = Some(id.to_owned());
+        s.picks.anchor = Some(id.to_owned());
+        return;
+    }
+    select_only(s, id.to_owned());
+}
+
+/// Moves the cursor by `by` items (a row of a grid is `cols` items), extending with Shift.
+pub fn step(s: &mut App, by: isize, extend: bool, tx: &mut Tx) {
+    let ids = active_ids(s);
+    if ids.is_empty() {
+        return;
+    }
+    let at = s.picks.cursor.as_ref().and_then(|c| ids.iter().position(|i| i == c));
+    let next = match at {
+        None if by < 0 => ids.len() - 1,
+        None => 0,
+        Some(i) => (i as isize + by).clamp(0, ids.len() as isize - 1) as usize,
+    };
+    let id = ids[next].clone();
+    if in_columns(s) {
+        reveal(s, id, tx);
+    } else if extend {
+        pick(s, &id, rune::Mods { shift: true, ..Default::default() });
+        tx.scroll_into_view_in(scroller(s), id);
+    } else {
+        select_only(s, id.clone());
+        tx.scroll_into_view_in(scroller(s), id);
+    }
+}
+
+// --- column view ------------------------------------------------------------
+
+/// The id of `name` in `dir`: its path relative to the window's folder.
+pub fn col_id(s: &App, dir: &Path, name: &str) -> String {
+    let p = dir.join(name);
+    p.strip_prefix(&s.dir).map_or_else(|_| p.to_string_lossy().into_owned(), |r| r.to_string_lossy().into_owned())
+}
+
+/// The column the keyboard is in: the last one with a pick, else the first.
+pub fn active_col(s: &App) -> usize {
+    s.cols.iter().rposition(|c| c.pick.is_some()).unwrap_or(0)
+}
+
+/// Picks `name` in column `i`: columns right of it close, and a folder opens the next one.
+pub fn col_pick(s: &mut App, i: usize, name: &str) {
+    if i >= s.cols.len() {
+        return;
+    }
+    s.cols.truncate(i + 1);
+    s.cols[i].pick = Some(name.to_owned());
+    let dir = s.cols[i].dir.clone();
+    let id = col_id(s, &dir, name);
+    select_only(s, id);
+    let folder = s.cols[i].entries.iter().find(|e| e.name == name).is_some_and(Entry::is_folder);
+    if folder {
+        s.cols.push(Column::read(dir.join(name), s.hidden));
+    }
+}
+
+/// → enters the picked folder's column; ← goes back to the column before.
+pub fn col_step(s: &mut App, right: bool, tx: &mut Tx) -> bool {
+    let i = active_col(s);
+    if right {
+        let Some(first) = s.cols.get(i + 1).and_then(|c| c.entries.first()).map(|e| e.name.clone()) else { return false };
+        col_pick(s, i + 1, &first);
+    } else {
+        if i == 0 {
+            return false;
+        }
+        let Some(name) = s.cols[i - 1].pick.clone() else { return false };
+        col_pick(s, i - 1, &name);
+    }
+    let id = focus_id(s).unwrap_or_default();
+    tx.scroll_into_view_in(scroller(s), id);
+    true
+}
+
+/// Re-reads every column after a change on disk, keeping the picks that still exist.
+pub fn reload_cols(s: &mut App) {
+    if s.cols.first().is_none_or(|c| c.dir != s.dir) {
+        s.cols = vec![Column::read(s.dir.clone(), s.hidden)];
+    }
+    let picks: Vec<Option<String>> = s.cols.iter().map(|c| c.pick.clone()).collect();
+    let dirs: Vec<PathBuf> = s.cols.iter().map(|c| c.dir.clone()).collect();
+    let mut cols = vec![];
+    for (dir, pick) in dirs.into_iter().zip(picks) {
+        if !dir.is_dir() {
+            break;
+        }
+        let mut c = Column::read(dir, s.hidden);
+        c.pick = pick.filter(|p| c.entries.iter().any(|e| &e.name == p));
+        let stop = c.pick.is_none();
+        cols.push(c);
+        if stop {
+            break;
+        }
+    }
+    s.cols = cols;
+    let keep: Vec<String> = s.picks.set.iter().filter(|id| s.dir.join(id).exists()).cloned().collect();
+    s.picks.set = keep;
+}
+
+/// Whether a name is being typed (keys less than a second apart), so Space types a space.
+pub fn typing(s: &App) -> bool {
+    s.typed.1.is_some_and(|t| t.elapsed().as_secs_f32() <= 1.0)
+}
+
+/// Type-to-select: letters typed within a second of each other pick the first item whose
+/// name starts with them, as Finder does.
+pub fn type_select(s: &mut App, t: &str, tx: &mut Tx) -> bool {
+    let now = Instant::now();
+    let fresh = !typing(s);
+    if fresh {
+        s.typed.0.clear();
+    }
+    if fresh && t == " " {
+        return false;
+    }
+    s.typed = (format!("{}{}", s.typed.0, t.to_lowercase()), Some(now));
+    let q = s.typed.0.clone();
+    let ids = active_ids(s);
+    let name = |id: &String| Path::new(id).file_name().map_or_else(|| id.to_lowercase(), |n| n.to_string_lossy().to_lowercase());
+    let hit = ids.iter().find(|id| name(id).starts_with(&q)).or_else(|| {
+        // Past every match: the first item after where the typed text would sort.
+        ids.iter().find(|id| rune_kit::natural_cmp(&name(id), &q).is_gt())
+    });
+    if let Some(id) = hit.cloned() {
+        reveal(s, id, tx);
+    }
+    true
+}
+
+// --- navigation -------------------------------------------------------------
+
+pub fn go(s: &mut App, to: PathBuf) {
+    if to == s.dir && !searching(s) {
+        return;
+    }
+    s.back.push(std::mem::replace(&mut s.dir, to));
+    s.fwd.clear();
+    entered(s);
+}
+
+pub fn entered(s: &mut App) {
+    s.search = TextEdit::new("");
+    s.found.cancel();
+    s.renaming = None;
+    clear_selection(s);
+    s.cols.clear();
+    load(s);
+}
+
+pub fn history(s: &mut App, back: bool) {
+    let (from, to) = if back { (&mut s.back, &mut s.fwd) } else { (&mut s.fwd, &mut s.back) };
+    if let Some(p) = from.pop() {
+        to.push(std::mem::replace(&mut s.dir, p));
+        entered(s);
+    }
+}
+
+/// ⌘↑: the enclosing folder, with the folder just left selected.
+pub fn up(s: &mut App, tx: &mut Tx) -> bool {
+    let Some(parent) = s.dir.parent().map(Path::to_path_buf) else { return false };
+    let child = s.dir.file_name().map(|n| n.to_string_lossy().into_owned());
+    go(s, parent);
+    if let Some(c) = child {
+        reveal(s, c, tx);
+    }
+    true
+}
+
+/// Expands "~" and resolves a path typed into Go to Folder against the current folder.
+pub fn resolve(s: &App, typed: &str) -> PathBuf {
+    let t = typed.trim();
+    if t == "~" {
+        home()
+    } else if let Some(rest) = t.strip_prefix("~/") {
+        home().join(rest)
+    } else {
+        s.dir.join(t)
+    }
+}
+
+pub fn display_name(p: &Path) -> String {
+    match p.file_name() {
+        Some(n) => n.to_string_lossy().into_owned(),
+        None => "Macintosh HD".into(),
+    }
+}
+
+pub fn icloud() -> Option<PathBuf> {
+    Some(home().join("Library/Mobile Documents/com~apple~CloudDocs")).filter(|p| p.is_dir())
+}
