@@ -7,36 +7,43 @@ mod dialogs;
 mod files;
 mod format;
 mod icons;
+mod mac;
 mod model;
 mod ops;
 
 use rune::{AppSpec, Chrome, Cx, El, KeyEvent, Tx, Waker, col, el};
 use rune_kit::shell::{self, SplitView};
-use rune_kit::{Kit, MenuItem, context_menu};
+use rune_kit::{Kit, Menu, MenuItem, context_menu};
 
 use model::{App, View};
 
-fn context_menu_el(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
+/// Closes whichever menu is open: the context menu, a toolbar menu or the sidebar's.
+pub fn close_menus(s: &mut App) {
+    s.menu = None;
+    s.popup = None;
+    s.side_menu = None;
+}
+
+/// The items of the file context menu, which the toolbar's … menu shows too, as Finder's do.
+pub fn file_menu(s: &App, menu: Menu) -> Menu {
     let some = model::selected_len(s) > 0;
     let one = model::selected_len(s) == 1;
     let item = |label: String, keys: &str, on: bool, f: fn(&mut App, &mut Tx)| {
         MenuItem::new(label).shortcut(keys.to_owned()).disabled(!on).on_select_tx(move |s: &mut App, tx: &mut Tx| {
-            s.menu = None;
+            close_menus(s);
             f(s, tx);
         })
     };
     let check = |label: &str, on: bool, f: fn(&mut App, &mut Tx)| {
         MenuItem::new(label.to_owned()).checked(on).on_select_tx(move |s: &mut App, tx: &mut Tx| {
-            s.menu = None;
+            close_menus(s);
             f(s, tx);
         })
     };
-    // The menu opens at the pointer, so its trigger is an empty anchor outside the list's layout.
-    // As wide as its ⌥ alternates need, so the menu keeps its width while ⌥ goes down and up.
-    let menu = context_menu("file-menu", el(), s.menu).min_width(260.0);
+    let folders = model::selected(s).iter().any(|p| p.is_dir());
     // Holding ⌥ swaps items for their alternates, as Finder's menu does.
     let alt = s.alt;
-    let menu = if some {
+    if some {
         let ids = model::selected_ids(s);
         let what = match ids.as_slice() {
             [id] => format!("“{}”", model::entry(s, id).map_or(id.as_str(), |e| e.name.as_str())),
@@ -70,6 +77,9 @@ fn context_menu_el(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
         if model::searching(s) {
             m = m.item(item("둘러싸는 폴더에서 보기".into(), "⌘R", one, ops::show_in_folder));
         }
+        if folders {
+            m = m.separator().item(item("사이드바에 추가".into(), "⌃⌘T", true, |s, _| model::add_to_sidebar(s)));
+        }
         m
     } else {
         let info = if alt { item("속성 보기".into(), "⌥⌘I", true, |s, _| ops::get_info(s)) } else { item("정보 가져오기".into(), "⌘I", true, |s, _| ops::get_info(s)) };
@@ -84,18 +94,26 @@ fn context_menu_el(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
             .item(check("계층으로 보기", s.view == View::Columns, |s, _| model::set_view(s, View::Columns)))
             .item(check("갤러리로 보기", s.view == View::Gallery, |s, _| model::set_view(s, View::Gallery)))
             .item(item(if s.hidden { "숨김 파일 가리기" } else { "숨김 파일 보기" }.into(), "⇧⌘.", true, |s, _| ops::toggle_hidden(s)))
-    };
-    menu.on_close(|s: &mut App| s.menu = None).build(k, layer)
+    }
+}
+
+fn context_menu_el(s: &App, k: &Kit, layer: &mut Vec<El>) -> El {
+    // The menu opens at the pointer, so its trigger is an empty anchor outside the list's layout.
+    // As wide as its ⌥ alternates need, so the menu keeps its width while ⌥ goes down and up.
+    let menu = context_menu("file-menu", el(), s.menu).min_width(260.0);
+    file_menu(s, menu).on_close(close_menus).build(k, layer)
 }
 
 fn view(s: &App, cx: &mut Cx<App>) -> El {
     let k = Kit::neutral(cx.system_dark());
     let mut layer = Vec::new();
 
+    // The list's stripes run on below its last row, down to the window's bottom, as Finder's do.
+    let list_h = cx.layout_with("files", |r| r[3]).unwrap_or(0.0);
     let body = match s.view {
         // A search lists its results whatever the view; Finder's columns can't show them.
-        View::List | View::Columns if model::searching(s) => files::list(s, &k),
-        View::List => files::list(s, &k),
+        View::List | View::Columns if model::searching(s) => files::list(s, &k, list_h),
+        View::List => files::list(s, &k, list_h),
         View::Columns => browse::columns(s, &k),
         View::Gallery => browse::gallery(s, &k),
         View::Icons => {
@@ -122,19 +140,27 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
     dialogs::info(s, &k, &mut layer);
     dialogs::goto(s, &k, &mut layer);
     dialogs::confirm_delete(s, &k, &mut layer);
+    let side_menu = chrome::side_menu(s, &k, &mut layer);
 
     let mut main = col().key("main").w_full().h_full().min_h(0.0);
     if model::searching(s) {
         main = main.child(chrome::scope_bar(s, &k));
     }
-    main = main.child(files).child(menu).child(chrome::path_bar(s, &k)).child(chrome::status(s, &k));
+    main = main.child(files).child(menu).child(side_menu).child(chrome::path_bar(s, &k)).child(chrome::status(s, &k));
 
+    // Finder's content runs flush to the window's edges beside the sidebar: square, not a card.
+    let mut flush = k.clone();
+    flush.radius.lg = 0.0;
+    flush.c.border_muted = k.c.border_weak;
     let shell = SplitView::new(main)
         .sidebar(&s.sidebar, |s: &mut App| &mut s.sidebar, chrome::sidebar(s, &k))
-        .toolbar(chrome::toolbar(s, &k))
+        .toolbar(chrome::toolbar(s, &k, &mut layer))
+        .toolbar_in_panel()
+        .frame_inset(0.0)
+        .hide_sidebar_toggle()
         .titlebar_inset(cx.titlebar_inset())
         .reduced_motion(cx.is_reduced_motion())
-        .build(&k);
+        .build(&flush);
     rune_kit::root(shell, layer)
 }
 
@@ -150,6 +176,7 @@ fn on_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
 static IMAGES_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn setup(s: &mut App, waker: Waker) {
+    s.waker = Some(waker.clone());
     s.found.set_waker(waker.clone());
     s.totals.set_waker(waker.clone());
     let images: Waker = std::sync::Arc::new(move || {
@@ -161,6 +188,7 @@ fn setup(s: &mut App, waker: Waker) {
 
 fn poll(s: &mut App, _: f64, _: &mut Tx) -> bool {
     let mut changed = IMAGES_READY.swap(false, std::sync::atomic::Ordering::Relaxed);
+    changed |= model::take_sizes(s);
     // Space closes Quick Look only while its window is open.
     if s.quick_look.as_mut().is_some_and(|c| c.try_wait().ok().flatten().is_some()) {
         s.quick_look = None;
@@ -205,6 +233,33 @@ static SCENES: &[Scene] = &[
         s.menu = Some(rune::PointerPress { x: 520.0, y: 120.0 });
     }),
     ("goto", dialogs::open_goto),
+    ("expanded", |s| {
+        let first = s.rows.iter().map(|&i| &s.all[i]).find(|e| e.is_folder()).map(|e| e.id.clone());
+        if let Some(id) = first {
+            model::toggle_expanded(s, &id);
+            model::select_only(s, id);
+        }
+    }),
+    ("grouped", |s| {
+        s.group = model::Group::Kind;
+        model::refresh(s);
+    }),
+    ("group-menu", |s| s.popup = Some(model::Popup::Group)),
+    ("tags-menu", |s| {
+        select_first(s);
+        s.popup = Some(model::Popup::Tags);
+    }),
+    ("more-menu", |s| {
+        select_first(s);
+        s.popup = Some(model::Popup::More);
+    }),
+    ("share-menu", |s| s.popup = Some(model::Popup::Share)),
+    ("sizes", model::toggle_sizes),
+    ("icons-grouped", |s| {
+        s.group = model::Group::Kind;
+        model::set_view(s, View::Icons);
+        select_first(s);
+    }),
 ];
 
 fn main() {

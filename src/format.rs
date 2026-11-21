@@ -65,8 +65,24 @@ fn local(secs: i64) -> Local {
     Local { year: tm.tm_year + 1900, month: tm.tm_mon + 1, day: tm.tm_mday, hour: tm.tm_hour, min: tm.tm_min, days }
 }
 
-fn now() -> i64 {
+pub fn now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// The 수정일 group a date falls in, Finder's buckets: 오늘, 어제, 지난 7일, 지난 30일, then
+/// by year, newest first. The number orders the groups.
+pub fn day_group(secs: i64, now: i64) -> (i64, String) {
+    if secs == 0 {
+        return (i64::MAX, "--".into());
+    }
+    let (t, today) = (local(secs), local(now));
+    match today.days - t.days {
+        i64::MIN..=0 => (0, "오늘".into()),
+        1 => (1, "어제".into()),
+        2..=6 => (2, "지난 7일".into()),
+        7..=29 => (3, "지난 30일".into()),
+        _ => (4 + (today.year - t.year) as i64, format!("{}년", t.year)),
+    }
 }
 
 /// Finder's list-view date: "오늘 오후 3:42", "어제 오전 9:05", else "2026년 11월 3일 오후 2:10".

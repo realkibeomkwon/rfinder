@@ -250,3 +250,170 @@ fn delete_immediately_asks_then_removes_for_good() {
     assert!(s.rows.is_empty() && s.error.is_none());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+fn ids(s: &App) -> Vec<String> {
+    s.rows.iter().map(|&i| s.all[i].id.clone()).collect()
+}
+
+#[test]
+fn an_expanded_folder_lists_its_items_under_it_in_order() {
+    let dir = scratch("outline");
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::create_dir_all(dir.join("b")).unwrap();
+    std::fs::write(dir.join("a/z.txt"), "x").unwrap();
+    std::fs::write(dir.join("a/y.txt"), "x").unwrap();
+    std::fs::write(dir.join("c.txt"), "x").unwrap();
+    let mut s = app_in(&dir);
+    model::toggle_expanded(&mut s, "a");
+    assert_eq!(ids(&s), ["a", "a/y.txt", "a/z.txt", "b", "c.txt"]);
+    // Other views show the folder's own items only, and the list gets its outline back.
+    model::set_view(&mut s, View::Icons);
+    assert_eq!(ids(&s), ["a", "b", "c.txt"]);
+    model::set_view(&mut s, View::List);
+    assert_eq!(ids(&s), ["a", "a/y.txt", "a/z.txt", "b", "c.txt"]);
+    // A reload keeps it open; closing it takes its items away.
+    model::load(&mut s);
+    assert_eq!(ids(&s).len(), 5);
+    model::toggle_expanded(&mut s, "a");
+    assert_eq!(ids(&s), ["a", "b", "c.txt"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn renaming_an_item_of_an_expanded_folder_keeps_it_in_that_folder() {
+    let dir = scratch("nested-rename");
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::write(dir.join("a/old.txt"), "x").unwrap();
+    let mut s = app_in(&dir);
+    model::toggle_expanded(&mut s, "a");
+    ops::begin_rename(&mut s, "a/old.txt".into());
+    s.rename = rune::TextEdit::new("new.txt");
+    ops::commit_rename(&mut s);
+    assert!(dir.join("a/new.txt").exists());
+    assert!(!dir.join("new.txt").exists());
+    assert_eq!(model::selected_ids(&s), ["a/new.txt"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn grouping_by_kind_starts_a_group_at_each_kind() {
+    let dir = scratch("group");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("b.md"), "x").unwrap();
+    std::fs::write(dir.join("a.md"), "x").unwrap();
+    let mut s = app_in(&dir);
+    s.group = model::Group::Kind;
+    model::refresh(&mut s);
+    assert_eq!(ids(&s), ["a.md", "b.md", "sub"]);
+    assert_eq!(s.groups, [(0, "Markdown 문서".to_owned()), (2, "폴더".to_owned())]);
+    // The icon view groups too, each group starting its own line; the gallery doesn't.
+    model::set_view(&mut s, View::Icons);
+    assert_eq!(s.groups.len(), 2);
+    use files::IconLine::{Items, Title};
+    assert_eq!(files::icon_lines(&s, 1), [Title(0), Items(0, 1), Items(1, 2), Title(1), Items(2, 3)]);
+    assert_eq!(files::icon_lines(&s, 5), [Title(0), Items(0, 2), Title(1), Items(2, 3)]);
+    model::set_view(&mut s, View::Gallery);
+    assert!(s.groups.is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn modified_groups_follow_finders_buckets() {
+    let now = format::now();
+    let day = 86_400;
+    assert_eq!(format::day_group(now, now).1, "오늘");
+    assert_eq!(format::day_group(now - 3 * day, now).1, "지난 7일");
+    assert_eq!(format::day_group(now - 20 * day, now).1, "지난 30일");
+    let old = format::day_group(now - 800 * day, now);
+    assert!(old.1.ends_with('년') && old.0 > format::day_group(now - 20 * day, now).0);
+}
+
+#[test]
+fn folder_sizes_arrive_once_counting_is_on() {
+    let dir = scratch("sizes");
+    std::fs::create_dir_all(dir.join("f/g")).unwrap();
+    std::fs::write(dir.join("f/one"), [0u8; 1000]).unwrap();
+    std::fs::write(dir.join("f/g/two"), [0u8; 500]).unwrap();
+    let mut s = app_in(&dir);
+    let f = s.all.iter().find(|e| e.id == "f").unwrap().clone();
+    assert_eq!(model::size_of(&s, &f), None);
+    model::toggle_sizes(&mut s);
+    let start = std::time::Instant::now();
+    while !s.sizes.contains_key(&dir.join("f")) && start.elapsed().as_secs() < 10 {
+        model::take_sizes(&mut s);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert_eq!(model::size_of(&s, &f), Some(1500));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn tags_go_on_and_come_off_the_file() {
+    let dir = scratch("tags");
+    std::fs::write(dir.join("t.txt"), "x").unwrap();
+    let mut s = app_in(&dir);
+    model::select_only(&mut s, "t.txt".into());
+    ops::toggle_tag(&mut s, "빨간색");
+    assert_eq!(s.error, None);
+    assert_eq!(mac::tags(&dir.join("t.txt")), ["빨간색"]);
+    // Read back from disk, not just the listing's copy.
+    model::load(&mut s);
+    assert_eq!(model::entry(&s, "t.txt").unwrap().tags, ["빨간색"]);
+    ops::toggle_tag(&mut s, "빨간색");
+    assert!(mac::tags(&dir.join("t.txt")).is_empty());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn sidebar_favorites_are_added_saved_and_removed() {
+    let dir = scratch("favorites");
+    std::fs::create_dir_all(dir.join("proj")).unwrap();
+    let file = dir.join("conf/favorites");
+    let mut s = app_in(&dir);
+    s.favorites_file = Some(file.clone());
+    s.favorites = model::load_favorites(Some(&file));
+    assert_eq!(s.favorites, model::default_favorites());
+    model::select_only(&mut s, "proj".into());
+    model::add_to_sidebar(&mut s);
+    model::add_to_sidebar(&mut s);
+    let saved = model::load_favorites(Some(&file));
+    assert_eq!(saved.iter().filter(|p| **p == dir.join("proj")).count(), 1);
+    model::remove_from_sidebar(&mut s, &dir.join("proj"));
+    assert!(!model::load_favorites(Some(&file)).contains(&dir.join("proj")));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn duplicating_inside_an_expanded_folder_selects_the_copy_there() {
+    let dir = scratch("nested-dup");
+    std::fs::create_dir_all(dir.join("a")).unwrap();
+    std::fs::write(dir.join("a/x.txt"), "x").unwrap();
+    let mut s = app_in(&dir);
+    model::toggle_expanded(&mut s, "a");
+    model::select_only(&mut s, "a/x.txt".into());
+    ops::duplicate(&mut s);
+    assert!(dir.join("a/x 사본.txt").exists());
+    assert_eq!(model::selected_ids(&s), ["a/x 사본.txt"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn favorites_move_by_drag_and_take_dropped_folders_only() {
+    let dir = scratch("fav-move");
+    std::fs::create_dir_all(dir.join("x")).unwrap();
+    std::fs::write(dir.join("file.txt"), "x").unwrap();
+    let file = dir.join("favorites");
+    let mut s = app_in(&dir);
+    s.favorites_file = Some(file.clone());
+    s.favorites = vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")];
+    model::move_favorite(&mut s, 0, 2);
+    assert_eq!(s.favorites, [PathBuf::from("/b"), PathBuf::from("/c"), PathBuf::from("/a")]);
+    model::move_favorite(&mut s, 2, 0);
+    assert_eq!(model::load_favorites(Some(&file)), [PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")]);
+    // A drop adds the folder once and leaves the file out.
+    model::add_favorites(&mut s, &[dir.join("x"), dir.join("file.txt"), dir.join("x")]);
+    assert_eq!(s.favorites.last(), Some(&dir.join("x")));
+    assert_eq!(s.favorites.len(), 4);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

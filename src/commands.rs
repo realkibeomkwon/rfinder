@@ -113,6 +113,12 @@ fn sidebar(s: &mut App, _: &mut Tx) {
 fn find(s: &mut App, _: &mut Tx) {
     s.search.focused = true;
 }
+fn add_to_sidebar(s: &mut App, _: &mut Tx) {
+    model::add_to_sidebar(s);
+}
+fn sizes(s: &mut App, _: &mut Tx) {
+    model::toggle_sizes(s);
+}
 fn reload(s: &mut App, _: &mut Tx) {
     model::load(s);
 }
@@ -174,6 +180,7 @@ pub fn key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             ('i', true, false) => icloud,
             ('l', false, true) => downloads,
             ('s', false, false) if m.ctrl => sidebar,
+            ('t', false, false) if m.ctrl => add_to_sidebar,
             _ => return false,
         },
         _ => return false,
@@ -204,6 +211,8 @@ pub fn menu_bar() -> Vec<MenuItem<App>> {
         item("파일", "복제", "cmd+d", duplicate),
         item("파일", "훑어보기", "cmd+y", quick_look),
         sep("파일"),
+        item("파일", "사이드바에 추가", "cmd+ctrl+t", add_to_sidebar),
+        sep("파일"),
         item("파일", "휴지통으로 이동", "cmd+backspace", trash),
         item("파일", "즉시 삭제…", "cmd+alt+backspace", delete_now),
         item("편집", "복사", "cmd+c", ops::copy),
@@ -218,6 +227,7 @@ pub fn menu_bar() -> Vec<MenuItem<App>> {
         sep("보기"),
         item("보기", "숨김 파일 보기/가리기", "cmd+shift+period", hidden),
         item("보기", "사이드바 보기/가리기", "cmd+ctrl+s", sidebar),
+        item("보기", "모든 크기 계산", "", sizes),
         item("이동", "뒤로", "cmd+bracketleft", back),
         item("이동", "앞으로", "cmd+bracketright", forward),
         item("이동", "상위 폴더", "cmd+up", enclosing),

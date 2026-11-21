@@ -122,7 +122,9 @@ pub fn commit_rename(s: &mut App) {
         // In the column view the renamed item stays picked in its column.
         Some(i) if model::in_columns(s) => model::col_pick(s, i, &new),
         _ => {
-            let new_id = if id.contains('/') { to.to_string_lossy().into_owned() } else { new };
+            // An expanded folder's item ("folder/name") or a search result (a full path) keeps
+            // its folder part.
+            let new_id = Path::new(&id).with_file_name(&new).to_string_lossy().into_owned();
             model::select_only(s, new_id);
         }
     }
@@ -161,8 +163,8 @@ pub fn duplicate(s: &mut App) {
     let err = s.error.take();
     model::load(s);
     s.error = err;
-    if let Some(n) = made.last().and_then(|p| p.file_name()) {
-        model::select_only(s, n.to_string_lossy().into_owned());
+    if let Some(p) = made.last() {
+        model::select_only(s, model::id_for(s, p));
     }
 }
 
@@ -271,8 +273,8 @@ pub fn compress(s: &mut App) {
         cmd.output().and_then(|o| if o.status.success() { Ok(()) } else { Err(std::io::Error::other(String::from_utf8_lossy(&o.stderr).trim().to_owned())) })
     };
     model::load(s);
-    if let (true, Some(n)) = (r.is_ok(), out.file_name()) {
-        model::select_only(s, n.to_string_lossy().into_owned());
+    if r.is_ok() {
+        model::select_only(s, model::id_for(s, &out));
     }
     fail(s, "압축할 수 없음", r);
 }
@@ -296,9 +298,17 @@ pub fn get_info(s: &mut App) {
 
 /// Bytes and items under `root`, counting each hard-linked file once.
 pub fn tally(root: &Path) -> (u64, u64) {
+    tally_until(root, &std::sync::atomic::AtomicBool::new(false))
+}
+
+/// `tally`, giving up (with what it has so far) once `stop` is set.
+pub fn tally_until(root: &Path, stop: &std::sync::atomic::AtomicBool) -> (u64, u64) {
     let (mut bytes, mut items, mut stack) = (0u64, 0u64, vec![root.to_path_buf()]);
     let mut seen = std::collections::HashSet::new();
     while let Some(dir) = stack.pop() {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
         let Ok(rd) = std::fs::read_dir(&dir) else { continue };
         for e in rd.flatten() {
             let Ok(m) = e.metadata() else { continue };
@@ -396,4 +406,35 @@ pub fn delete_now(s: &mut App) {
 pub fn toggle_hidden(s: &mut App) {
     s.hidden ^= true;
     if model::searching(s) { model::request_search(s) } else { model::refresh(s) }
+}
+
+/// The tags menu: a colour every selected item has comes off them all, else goes on them all.
+pub fn toggle_tag(s: &mut App, tag: &str) {
+    let ids = model::selected_ids(s);
+    let all_have = !ids.is_empty() && ids.iter().all(|id| model::entry(s, id).is_some_and(|e| e.tags.iter().any(|t| t == tag)));
+    for id in ids {
+        let mut tags = model::entry(s, &id).map(|e| e.tags.clone()).unwrap_or_default();
+        tags.retain(|t| t != tag);
+        if !all_have {
+            tags.push(tag.to_owned());
+        }
+        let r = crate::mac::set_tags(&s.dir.join(&id), &tags);
+        if r.is_ok()
+            && let Some(e) = s.all.iter_mut().find(|e| e.id == id)
+        {
+            e.tags = tags;
+        }
+        fail(s, "태그를 지정할 수 없음", r);
+    }
+}
+
+/// The share menu: the selection, or this folder with nothing selected.
+pub fn share(s: &mut App, to: crate::mac::Share) {
+    let mut paths = model::selected(s);
+    if paths.is_empty() {
+        paths.push(s.dir.clone());
+    }
+    if let Err(e) = crate::mac::share(to, &paths) {
+        s.error = Some(format!("공유할 수 없음: {e}"));
+    }
 }
